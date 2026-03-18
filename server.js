@@ -1,0 +1,229 @@
+// ============================================================
+//  QR Registration System — Node.js + MySQL API Server
+//  Usage: node server.js
+//  Accessible by ALL devices on the same LAN at http://<this-PC-IP>:3000
+// ============================================================
+
+const express = require('express');
+const mysql = require('mysql2/promise');
+const cors = require('cors');
+const path = require('path');
+
+// ── Fetch Polyfill (For older Node.js versions) ──────────────
+if (typeof fetch === 'undefined') {
+    global.fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
+}
+
+const app = express();
+const PORT = 3000;
+
+// ── MySQL Connection Pool ────────────────────────────────────
+// This works for BOTH Localhost and Cloud (Aiven/Railway)
+const pool = mysql.createPool({
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'qr_system',
+    ssl: process.env.DB_HOST ? { rejectUnauthorized: false } : null,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
+});
+
+// ── Middleware ───────────────────────────────────────────────
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+
+app.use((req, res, next) => {
+    res.setHeader('Permissions-Policy', 'camera=*, microphone=*');
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+    res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+    next();
+});
+
+app.use(express.static(path.join(__dirname)));
+
+// ── Endpoints ────────────────────────────────────────────────
+app.get('/api/health', (req, res) => {
+    res.json({ ok: true, time: new Date().toISOString() });
+});
+
+app.get('/display', (req, res) => {
+    res.sendFile(path.join(__dirname, 'display.html'));
+});
+
+// GUESTS 
+app.get('/api/guests', async (req, res) => {
+    try {
+        const [rows] = await pool.query('SELECT * FROM guests ORDER BY name');
+        const guests = rows.map(r => ({
+            id: r.id,
+            Name: r.name,
+            Department: r.department,
+            'Job Title': r.job_title,
+            'Table Number': r.table_number,
+            Email: r.gmail || ''
+        }));
+        res.json(guests);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/guests', async (req, res) => {
+    const guests = req.body;
+    if (!Array.isArray(guests)) return res.status(400).json({ error: 'Expected array' });
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+        await conn.query('DELETE FROM guests');
+        if (guests.length > 0) {
+            const values = guests.map(g => [g.id, g.Name || '', g.Department || '', g['Job Title'] || '', g['Table Number'] || '', g.Email || g.gmail || '']);
+            await conn.query('INSERT INTO guests (id, name, department, job_title, table_number, gmail) VALUES ?', [values]);
+        }
+        await conn.commit();
+        res.json({ ok: true });
+    } catch (err) {
+        await conn.rollback();
+        res.status(500).json({ error: err.message });
+    } finally {
+        conn.release();
+    }
+});
+
+// REGISTRATIONS
+app.get('/api/registrations', async (req, res) => {
+    try {
+        const [rows] = await pool.query('SELECT * FROM registrations ORDER BY created_at DESC');
+        const regs = rows.map(r => ({
+            id: r.scan_id || String(r.id),
+            tableNo: r.table_no,
+            scanData: r.scan_data,
+            guestId: r.guest_id,
+            department: r.department,
+            timestamp: r.timestamp
+        }));
+        res.json(regs);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/registrations', async (req, res) => {
+    const r = req.body;
+    try {
+        await pool.query(
+            `INSERT INTO registrations (scan_id, guest_id, scan_data, department, table_no, timestamp) VALUES (?, ?, ?, ?, ?, ?)`,
+            [String(r.id || Date.now()), r.guestId || null, r.scanData, r.department || '', String(r.tableNo || ''), r.timestamp || new Date().toLocaleString()]
+        );
+        res.json({ ok: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.delete('/api/registrations', async (req, res) => {
+    try {
+        await pool.query('DELETE FROM registrations');
+        res.json({ ok: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.delete('/api/registrations/:id', async (req, res) => {
+    try {
+        await pool.query('DELETE FROM registrations WHERE scan_id = ?', [String(req.params.id)]);
+        res.json({ ok: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ════════════════════════════════════════════════════════════
+//  EMAIL (BREVO)
+// ════════════════════════════════════════════════════════════
+app.post('/api/send-email', async (req, res) => {
+    const { toEmail, toName, toJob, toDept, qrData } = req.body;
+
+    // ⚠️ PASTE YOUR NEW BREVO KEY HERE ⚠️
+    const BREVO_API_KEY = process.env.BREVO_API_KEY || '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';
+    const SENDER_EMAIL = 'pitogojohncarlo50@gmail.com';
+    const SENDER_NAME = 'SLU J&T Event Registration';
+
+    const qrPublicUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qrData)}`;
+    let qrBase64 = '';
+    try {
+        const imgRes = await fetch(qrPublicUrl);
+        const imgArrayBuffer = await imgRes.arrayBuffer();
+        qrBase64 = Buffer.from(imgArrayBuffer).toString('base64');
+    } catch (err) {
+        return res.status(500).json({ error: 'Failed to generate QR attachment.' });
+    }
+
+    const payload = {
+        sender: { name: SENDER_NAME, email: SENDER_EMAIL },
+        to: [{ email: toEmail, name: toName || 'Guest' }],
+        subject: 'Your Event Invitation & QR Code',
+        htmlContent: `
+            <div style="font-family: Arial, sans-serif; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 8px;">
+                <h2 style="color: #6c63ff; text-align: center;">Event Invitation & QR Code</h2>
+                <p>Hello Mr/Ms. <b>${toName || 'Guest'}</b>,</p>
+                <p>You are cordially invited to an evening of celebration and recognition as we commemorate seven years of excellence and success.</p>
+                
+                </br> 
+
+                <h2 style="color: #6c63ff; text-align: left;">Event Details</h2>
+                <p><b>Date:</b> March 28, 2026 (Saturday)</p>
+                <p><b>Registration Opens:</b> 4:00 PM</p>
+                <p><b>Venue:</b> Enchanting Events Place</p>
+                <p>Enchanted Kingdom, Santa Rosa City, Laguna</p>
+                
+                </br> 
+
+                <h2 style="color: #6c63ff; text-align: center;">Attire Guidlines:</h2>
+                <p style="text-align: center"> <b> Formal Attire - Hollywood Themed</b></p>
+                </br>
+                <p style="text-align: center"> Please choose outfits in any shade of the following colors:</p>
+                <p style="text-align: center"> <b> Black, Red, Blue, Gold, Silver, Brown, or White.</b></p>
+                
+                <div style="margin: 30px auto; padding: 25px; border: 2px dashed #ccc; border-radius: 12px; text-align: center; max-width: 350px; background-color: #fafafa;">
+                <img src="${qrPublicUrl}" alt="QR Code" style="width: 250px; height: 250px; display: block; margin: 0 auto; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);" />
+                <h3 style="margin: 20px 0 5px 0; font-size: 24px; color: #222;">${toName || ''}</h3>
+                <p style="margin: 0; font-size: 16px; color: #555; font-weight: 600;">${toJob || ''}</p>
+                <p style="margin: 5px 0 0 0; font-size: 14px; color: #888;">${toDept || ''}</p>
+                </div>
+                
+                <p style="text-align: center">Present this QR Code upon entry. Please keep it private and do not share it.</p>
+
+                <p style="text-align: center;">For any questions, please contact:</p>
+                <p style="text-align: center;">Catherine B. Gural</p>
+                <p style="text-align: center;">cbgural@jtexpress.ph</p>
+                <p style="text-align: center;">0920-979-8178</p>
+           
+            </div>
+        `,
+        attachment: [{
+            content: qrBase64,
+            name: "qrcode.png",
+            contentType: "image/png"
+        }]
+    };
+
+    try {
+        const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+            method: 'POST',
+            headers: { 'api-key': BREVO_API_KEY, 'content-type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await response.json();
+        if (!response.ok) return res.status(500).json({ error: data.message });
+        res.json({ ok: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ Server running at http://localhost:${PORT}`);
+});
