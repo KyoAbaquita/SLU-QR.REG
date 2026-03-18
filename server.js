@@ -15,7 +15,7 @@ if (typeof fetch === 'undefined') {
 }
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 // ── MySQL Connection Pool ────────────────────────────────────
 // This works for BOTH Localhost and Cloud (Aiven/Railway)
@@ -43,9 +43,8 @@ app.use((req, res, next) => {
 
 app.use(express.static(path.join(__dirname)));
 
-// ── Endpoints ────────────────────────────────────────────────
-app.get('/api/health', (req, res) => {
-    res.json({ ok: true, time: new Date().toISOString() });
+app.get('/', (req, res) => {
+    res.sendFile(path.join(process.cwd(), 'index.html'));
 });
 
 app.get('/display', (req, res) => {
@@ -224,6 +223,12 @@ app.post('/api/send-email', async (req, res) => {
     }
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`✅ Server running at http://localhost:${PORT}`);
-});
+// For local development
+if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
+    app.listen(PORT, '0.0.0.0', () => {
+        console.log(`✅ Local Server running at http://localhost:${PORT}`);
+    });
+}
+
+// MUST export for Vercel
+module.exports = app;
